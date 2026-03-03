@@ -1,10 +1,9 @@
-package org.example.compiler
-
+package compiler
 import MiniKotlinBaseVisitor
-import MiniKotlinParser
+
+
 
 class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
-
     fun compile(program: MiniKotlinParser.ProgramContext, className: String = "MiniProgram"): String {
         return """
             public class $className {
@@ -15,4 +14,19 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         """.trimIndent()
     }
 
+    override fun visitIntLiteral(ctx: MiniKotlinParser.IntLiteralContext): String {
+        return ctx.INTEGER_LITERAL().text
+    }
+
+    override fun visitStringLiteral(ctx: MiniKotlinParser.StringLiteralContext): String {
+        return ctx.STRING_LITERAL().text
+    }
+
+    override fun visitBoolLiteral(ctx: MiniKotlinParser.BoolLiteralContext): String {
+        return ctx.BOOLEAN_LITERAL().text
+    }
+
+    override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext): String {
+        return ctx.IDENTIFIER().text
+    }
 }

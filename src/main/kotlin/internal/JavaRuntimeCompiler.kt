@@ -1,5 +1,8 @@
 package org.example.compiler
 
+import internal.CompilationError
+import internal.CompilationResult
+import internal.ExecutionResult
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 import java.net.URLClassLoader

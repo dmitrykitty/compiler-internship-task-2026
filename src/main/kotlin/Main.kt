@@ -4,8 +4,8 @@ import MiniKotlinLexer
 import MiniKotlinParser
 import org.antlr.v4.runtime.CharStreams
 import org.antlr.v4.runtime.CommonTokenStream
-import org.example.compiler.CompilationResult
-import org.example.compiler.ExecutionResult
+import internal.CompilationResult
+import internal.ExecutionResult
 import org.example.compiler.JavaRuntimeCompiler
 import org.example.compiler.MiniKotlinCompiler
 import java.io.File

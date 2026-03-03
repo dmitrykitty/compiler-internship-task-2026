@@ -1,4 +1,4 @@
-package org.example.compiler
+package internal
 
 sealed class CompilationResult {
     data class Success(

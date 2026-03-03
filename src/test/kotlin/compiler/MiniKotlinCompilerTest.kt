@@ -2,6 +2,8 @@ package org.example.compiler
 
 import MiniKotlinLexer
 import MiniKotlinParser
+import internal.CompilationResult
+import internal.ExecutionResult
 import org.antlr.v4.runtime.CharStreams
 import org.antlr.v4.runtime.CommonTokenStream
 import org.junit.jupiter.api.Test

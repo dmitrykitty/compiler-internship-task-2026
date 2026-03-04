@@ -8,23 +8,24 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private fun nextArg() = "arg${counter++}"
 
     fun compile(program: MiniKotlinParser.ProgramContext, className: String = "MiniProgram"): String {
-        val sb = StringBuilder()
+        val functions = program.functionDeclaration()
+            .joinToString("\n\n") { indent(genFunction(it).trimEnd(), 1) }
 
-        sb.appendLine("public class $className {")
-
-        for (fn in program.functionDeclaration()) {
-            sb.appendLine(genFunction(fn))
+        return buildString {
+            appendLine("public class $className {")
+            if (functions.isNotBlank()) {
+                appendLine()
+                appendLine(functions)
+                appendLine()
+            }
+            appendLine("}")
         }
-
-        sb.appendLine("}")
-
-        return sb.toString()
     }
 
     private fun genFunction(ctx: MiniKotlinParser.FunctionDeclarationContext): String {
         val name = ctx.IDENTIFIER().text
+        val retType = mapType(ctx.type().text)
 
-        val retType = mapType(ctx.type().text) // uwaga: dla "void" to Java void
         val params = ctx.parameterList()?.parameter()?.map { p ->
             val id = p.IDENTIFIER().text
             val t = mapType(p.type().text)
@@ -34,27 +35,22 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         val header = if (name == "main") {
             "public static void main(String[] args)"
         } else {
-            // dla non-main: normalna funkcja (jeszcze nie CPS)
             "public static $retType $name(${params.joinToString(", ")})"
         }
 
         val body = genBlock(ctx.block())
 
-        return """
-        $header {
-        $body
+        return buildString {
+            appendLine("$header {")
+            appendLine(indent(body, 1))
+            appendLine("}")
         }
-    """.trimIndent()
     }
 
     private fun genBlock(ctx: MiniKotlinParser.BlockContext): String {
-        val sb = StringBuilder()
-
-        for (st in ctx.statement()) {
-            sb.appendLine(genStatement(st))
-        }
-
-        return sb.toString()
+        return ctx.statement()
+            .joinToString("\n") { genStatement(it) }
+            .trimEnd()
     }
 
     private fun genStatement(ctx: MiniKotlinParser.StatementContext): String {
@@ -84,33 +80,32 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
     private fun genIf(ctx: MiniKotlinParser.IfStatementContext): String {
-
         val cond = visit(ctx.expression())
         val thenBlock = genBlock(ctx.block(0))
 
-        val elsePart =
-            if (ctx.block().size > 1)
-                "else {\n${genBlock(ctx.block(1))}\n}"
-            else
-                ""
+        val elseBlock = if (ctx.block().size > 1) genBlock(ctx.block(1)) else null
 
-        return """
-        if ($cond) {
-        $thenBlock
-        }
-        $elsePart
-    """.trimIndent()
+        return buildString {
+            appendLine("if ($cond) {")
+            appendLine(indent(thenBlock, 1))
+            appendLine("}")
+            if (elseBlock != null) {
+                appendLine("else {")
+                appendLine(indent(elseBlock, 1))
+                appendLine("}")
+            }
+        }.trimEnd()
     }
 
     private fun genWhile(ctx: MiniKotlinParser.WhileStatementContext): String {
         val cond = visit(ctx.expression())
         val body = genBlock(ctx.block())
 
-        return """
-        while ($cond) {
-        $body
-        }
-    """.trimIndent()
+        return buildString {
+            appendLine("while ($cond) {")
+            if (body.isNotBlank()) appendLine(indent(body, 1))
+            appendLine("}")
+        }.trimEnd()
     }
 
     private fun genReturn(ctx: MiniKotlinParser.ReturnStatementContext): String {
@@ -249,5 +244,14 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             "Unit" -> "void"
             else -> type
         }
+    }
+
+    private fun indent(code: String, level: Int = 1): String {
+        val pad = "    ".repeat(level)
+        return code
+            .lines()
+            .joinToString("\n") { line ->
+                if (line.isBlank()) line else pad + line
+            }
     }
 }

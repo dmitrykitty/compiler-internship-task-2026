@@ -24,7 +24,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
 
     private fun genFunction(ctx: MiniKotlinParser.FunctionDeclarationContext): String {
         val name = ctx.IDENTIFIER().text
-        val retType = mapType(ctx.type().text)
+        val kotlinReturnType = mapType(ctx.type().text)
 
         val params = ctx.parameterList()?.parameter()?.map { p ->
             val id = p.IDENTIFIER().text
@@ -35,25 +35,34 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         val header = if (name == "main") {
             "public static void main(String[] args)"
         } else {
-            "public static $retType $name(${params.joinToString(", ")})"
+            val allParams = params + continuationParam(kotlinReturnType)
+            "public static void $name(${allParams.joinToString(", ")})"
         }
-
-        val body = genBlock(ctx.block())
+        val isMain = (name == "main")
+        val body = genBlock(ctx.block(), isMain, kotlinReturnType)
 
         return buildString {
             appendLine("$header {")
-            appendLine(indent(body, 1))
+            if (body.isNotBlank()) appendLine(indent(body, 1))
             appendLine("}")
         }
     }
 
-    private fun genBlock(ctx: MiniKotlinParser.BlockContext): String {
+    private fun genBlock(
+        ctx: MiniKotlinParser.BlockContext,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String {
         return ctx.statement()
-            .joinToString("\n") { genStatement(it) }
+            .joinToString("\n") { genStatement(it, isMain, kotlinReturnType) }
             .trimEnd()
     }
 
-    private fun genStatement(ctx: MiniKotlinParser.StatementContext): String {
+    private fun genStatement(
+        ctx: MiniKotlinParser.StatementContext,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String {
 
         return when {
 
@@ -64,13 +73,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
                 genVariableAssignment(ctx.variableAssignment())
 
             ctx.ifStatement() != null ->
-                genIf(ctx.ifStatement())
+                genIf(ctx.ifStatement(), isMain, kotlinReturnType)
 
             ctx.whileStatement() != null ->
-                genWhile(ctx.whileStatement())
+                genWhile(ctx.whileStatement(), isMain, kotlinReturnType)
 
             ctx.returnStatement() != null ->
-                genReturn(ctx.returnStatement())
+                genReturn(ctx.returnStatement(), isMain, kotlinReturnType)
 
             ctx.expression() != null ->
                 genExpressionStatement(ctx.expression())
@@ -79,27 +88,34 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
-    private fun genIf(ctx: MiniKotlinParser.IfStatementContext): String {
+    private fun genIf(
+        ctx: MiniKotlinParser.IfStatementContext,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String {
         val cond = visit(ctx.expression())
-        val thenBlock = genBlock(ctx.block(0))
-
-        val elseBlock = if (ctx.block().size > 1) genBlock(ctx.block(1)) else null
+        val thenBlock = genBlock(ctx.block(0), isMain, kotlinReturnType)
+        val elseBlock = if (ctx.block().size > 1) genBlock(ctx.block(1), isMain, kotlinReturnType) else null
 
         return buildString {
             appendLine("if ($cond) {")
-            appendLine(indent(thenBlock, 1))
+            if (thenBlock.isNotBlank()) appendLine(indent(thenBlock, 1))
             appendLine("}")
             if (elseBlock != null) {
                 appendLine("else {")
-                appendLine(indent(elseBlock, 1))
+                if (elseBlock.isNotBlank()) appendLine(indent(elseBlock, 1))
                 appendLine("}")
             }
         }.trimEnd()
     }
 
-    private fun genWhile(ctx: MiniKotlinParser.WhileStatementContext): String {
+    private fun genWhile(
+        ctx: MiniKotlinParser.WhileStatementContext,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String {
         val cond = visit(ctx.expression())
-        val body = genBlock(ctx.block())
+        val body = genBlock(ctx.block(), isMain, kotlinReturnType)
 
         return buildString {
             appendLine("while ($cond) {")
@@ -108,12 +124,22 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }.trimEnd()
     }
 
-    private fun genReturn(ctx: MiniKotlinParser.ReturnStatementContext): String {
+    private fun genReturn(
+        ctx: MiniKotlinParser.ReturnStatementContext,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String {
         val expr = ctx.expression()
+
+        if (isMain) {
+            return if (expr != null) "return ${visit(expr)};" else "return;"
+        }
+
         return if (expr != null) {
-            "return ${visit(expr)};"
+            val value = visit(expr)
+            "__continuation.accept($value);\nreturn;"
         } else {
-            "return;"
+            "__continuation.accept(null);\nreturn;"
         }
     }
 
@@ -124,8 +150,20 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
     private fun genExpressionStatement(expr: MiniKotlinParser.ExpressionContext): String {
-        val code = visit(expr)
-        return "$code;"
+        if (expr is MiniKotlinParser.FunctionCallExprContext) {
+            val name = expr.IDENTIFIER().text
+            val args = expr.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
+
+            if (name == "println") {
+                val value = args.singleOrNull() ?: error("println expects 1 argument")
+                val arg = nextArg()
+
+                // Na razie: kontynuacja pusta (czyli "koniec")
+                // W kolejnym kroku podmienimy to na "kontynuacja = reszta statementów"
+                return "Prelude.println($value, ($arg) -> { });"
+            }
+        }
+        return "${visit(expr)};"
     }
 
     private fun genVariableDeclaration(ctx: MiniKotlinParser.VariableDeclarationContext): String {
@@ -236,12 +274,15 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return ctx.IDENTIFIER().text
     }
 
+    private fun continuationParam(returnType: String): String =
+        "Continuation<${mapType(returnType)}> __continuation"
+
     private fun mapType(type: String): String {
         return when (type) {
             "Int" -> "Integer"
             "String" -> "String"
             "Boolean" -> "Boolean"
-            "Unit" -> "void"
+            "Unit" -> "Void"
             else -> type
         }
     }

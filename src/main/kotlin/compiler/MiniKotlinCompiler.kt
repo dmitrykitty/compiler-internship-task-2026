@@ -24,7 +24,8 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
 
     private fun genFunction(ctx: MiniKotlinParser.FunctionDeclarationContext): String {
         val name = ctx.IDENTIFIER().text
-        val kotlinReturnType = mapType(ctx.type().text)
+        val kotlinReturnType = ctx.type().text
+        //val javaReturnType = mapType(kotlinReturnType)
 
         val params = ctx.parameterList()?.parameter()?.map { p ->
             val id = p.IDENTIFIER().text
@@ -48,14 +49,118 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    private fun genStatements(
+        st: List<MiniKotlinParser.StatementContext>,
+        i: Int,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String {
+        if (i >= st.size) return ""
+
+        val curSt = st[i]
+
+        // 0) Pomocniczo: wygeneruj resztę
+        fun rest(): String = genStatements(st, i + 1, isMain, kotlinReturnType)
+
+        // 1) var x: T = expr  (jeśli expr wymaga CPS)
+        curSt.variableDeclaration()?.let { vd ->
+            val name = vd.IDENTIFIER().text
+            val type = mapType(vd.type().text)
+            val expr = vd.expression()
+
+            if (containsFunctionCall(expr)) {
+                val restCode = rest()
+                return emitExprCps(expr) { value ->
+                    buildString {
+                        appendLine("$type $name = $value;")
+                        if (restCode.isNotBlank()) append(restCode)
+                    }.trimEnd()
+                }
+            }
+            // jeśli nie ma call — spadnie do normalnego statement poniżej
+        }
+
+        // 2) expression-statement: function call
+        val expr = curSt.expression()
+        if (expr is MiniKotlinParser.FunctionCallExprContext) {
+            val name = expr.IDENTIFIER().text
+            val args = expr.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
+            val tmp = nextArg()
+            val restCode = rest()
+
+            // 2a) println -> Prelude.println(msg, cont)
+            if (name == "println") {
+                val value = args.singleOrNull() ?: error("println expects 1 argument")
+                return buildString {
+                    appendLine("Prelude.println($value, ($tmp) -> {")
+                    if (restCode.isNotBlank()) appendLine(indent(restCode, 1))
+                    appendLine("});")
+                }.trimEnd()
+            }
+
+            // 2b) zwykły call-statement -> name(args..., cont)
+            return buildString {
+                appendLine("$name(${args.joinToString(", ")}, ($tmp) -> {")
+                if (restCode.isNotBlank()) appendLine(indent(restCode, 1))
+                appendLine("});")
+            }.trimEnd()
+        }
+
+        // 3) Normalny statement (if/while/assign/return/var bez call)
+        val cur = genStatement(curSt, isMain, kotlinReturnType).trimEnd()
+        val restCode = rest()
+
+        return when {
+            cur.isBlank() -> restCode
+            restCode.isBlank() -> cur
+            else -> cur + "\n" + restCode
+        }
+    }
+
+    private fun emitExprCps(expr: MiniKotlinParser.ExpressionContext, k: (String) -> String): String {
+        if (!containsFunctionCall(expr)) return k(visit(expr))
+
+        if (expr is MiniKotlinParser.FunctionCallExprContext) {
+            val name = expr.IDENTIFIER().text
+            val args = expr.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
+            val tmp = nextArg()
+
+            val body = k(tmp)
+            return buildString {
+                appendLine("$name(${args.joinToString(", ")}, ($tmp) -> {")
+                if (body.isNotBlank()) appendLine(indent(body, 1))
+                appendLine("});")
+            }.trimEnd()
+        }
+
+        if(isBinaryByShape(expr)){
+            val left = expr.getChild(0) as MiniKotlinParser.ExpressionContext
+            val op = expr.getChild(1).text
+            val right = expr.getChild(2) as MiniKotlinParser.ExpressionContext
+
+            return emitExprCps(left) { lv ->
+                emitExprCps(right) { rv ->
+                    k("($lv $op $rv)")
+                }
+            }
+        }
+
+        if (expr is MiniKotlinParser.NotExprContext) {
+            return emitExprCps(expr.expression()) { v ->
+                k("(!($v))")
+            }
+        }
+        // fallback
+        return k(visit(expr))
+    }
+
     private fun genBlock(
         ctx: MiniKotlinParser.BlockContext,
         isMain: Boolean,
         kotlinReturnType: String
     ): String {
-        return ctx.statement()
-            .joinToString("\n") { genStatement(it, isMain, kotlinReturnType) }
-            .trimEnd()
+        val st = ctx.statement()
+        return genStatements(st, 0, isMain, kotlinReturnType).trimEnd()
     }
 
     private fun genStatement(
@@ -131,15 +236,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     ): String {
         val expr = ctx.expression()
 
-        if (isMain) {
-            return if (expr != null) "return ${visit(expr)};" else "return;"
-        }
+        if (isMain) return if (expr != null) "return ${visit(expr)};" else "return;"
 
-        return if (expr != null) {
-            val value = visit(expr)
+        if (expr == null) return "__continuation.accept(null);\nreturn;"
+
+        // CPS: policz expr (nawet z callami) i dopiero wtedy accept + return
+        return emitExprCps(expr) { value ->
             "__continuation.accept($value);\nreturn;"
-        } else {
-            "__continuation.accept(null);\nreturn;"
         }
     }
 
@@ -150,19 +253,6 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
     private fun genExpressionStatement(expr: MiniKotlinParser.ExpressionContext): String {
-        if (expr is MiniKotlinParser.FunctionCallExprContext) {
-            val name = expr.IDENTIFIER().text
-            val args = expr.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
-
-            if (name == "println") {
-                val value = args.singleOrNull() ?: error("println expects 1 argument")
-                val arg = nextArg()
-
-                // Na razie: kontynuacja pusta (czyli "koniec")
-                // W kolejnym kroku podmienimy to na "kontynuacja = reszta statementów"
-                return "Prelude.println($value, ($arg) -> { });"
-            }
-        }
         return "${visit(expr)};"
     }
 
@@ -179,11 +269,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         val name = ctx.IDENTIFIER().text
         val args = ctx.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
 
-        return if (name == "println") {
-            "System.out.println(${args.joinToString(", ")})"
-        } else {
-            "$name(${args.joinToString(", ")})"
-        }
+        return "$name(${args.joinToString(", ")})"
     }
 
     //( expression )
@@ -274,8 +360,43 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return ctx.IDENTIFIER().text
     }
 
-    private fun continuationParam(returnType: String): String =
-        "Continuation<${mapType(returnType)}> __continuation"
+    private fun containsFunctionCall(expr: MiniKotlinParser.ExpressionContext): Boolean = when (expr) {
+        is MiniKotlinParser.FunctionCallExprContext -> true
+        is MiniKotlinParser.PrimaryExprContext -> {
+            val p = expr.primary()
+            if (p is MiniKotlinParser.ParenExprContext) containsFunctionCall(p.expression()) else false
+        }
+        is MiniKotlinParser.NotExprContext -> containsFunctionCall(expr.expression())
+        is MiniKotlinParser.AddSubExprContext -> containsFunctionCall(expr.expression(0)) ||
+                containsFunctionCall(expr.expression(1))
+        is MiniKotlinParser.MulDivExprContext -> containsFunctionCall(expr.expression(0)) ||
+                containsFunctionCall(expr.expression(1))
+        is MiniKotlinParser.ComparisonExprContext -> containsFunctionCall(expr.expression(0)) ||
+                containsFunctionCall(expr.expression(1))
+        is MiniKotlinParser.EqualityExprContext -> containsFunctionCall(expr.expression(0)) ||
+                containsFunctionCall(expr.expression(1))
+        is MiniKotlinParser.AndExprContext -> containsFunctionCall(expr.expression(0)) ||
+                containsFunctionCall(expr.expression(1))
+        is MiniKotlinParser.OrExprContext -> containsFunctionCall(expr.expression(0)) ||
+                containsFunctionCall(expr.expression(1))
+        else -> false
+    }
+
+    private fun continuationParam(kotlinType: String): String {
+        return "Continuation<${mapType(kotlinType)}> __continuation"
+    }
+
+    private fun isFunctionCall(expr: MiniKotlinParser.ExpressionContext): Boolean {
+        return expr is MiniKotlinParser.FunctionCallExprContext
+    }
+
+    private fun isBinaryByShape(expr: MiniKotlinParser.ExpressionContext): Boolean {
+        if (expr.childCount != 3) return false
+        val mid = expr.getChild(1)
+        return mid !is MiniKotlinParser.ExpressionContext
+    }
+
+
 
     private fun mapType(type: String): String {
         return when (type) {

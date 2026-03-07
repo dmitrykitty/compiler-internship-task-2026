@@ -35,7 +35,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         val header = buildFunctionHeader(ctx, functionName, kotlinReturnType)
         val body = compileBlock(ctx.block(), isMain, kotlinReturnType)
 
-        return wrapInBraces(header, body)
+        val finalBody = if (shouldEmitImplicitUnitReturn(ctx, isMain, kotlinReturnType)) {
+            joinCode(body, "__continuation.accept(null);\nreturn;")
+        } else {
+            body
+        }
+
+        return wrapInBraces(header, finalBody)
     }
 
     private fun resetFunctionState() {
@@ -348,7 +354,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     ): String {
         return compileExpressionCps(operation.left) { leftValue ->
             compileExpressionCps(operation.right) { rightValue ->
-                onComplete("($leftValue ${operation.operator} $rightValue)")
+                val rendered = when (operation.operator) {
+                    "==" -> renderEquality(leftValue, rightValue, isEqual = true)
+                    "!=" -> renderEquality(leftValue, rightValue, isEqual = false)
+                    else -> "($leftValue ${operation.operator} $rightValue)"
+                }
+                onComplete(rendered)
             }
         }
     }
@@ -389,6 +400,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    //=======================HELPERS============================
     private fun buildIf(
         condition: String,
         thenBody: String,
@@ -533,12 +545,62 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             else -> false
         }
 
+    private fun shouldEmitImplicitUnitReturn(
+        ctx: MiniKotlinParser.FunctionDeclarationContext,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): Boolean {
+        if (isMain || kotlinReturnType != "Unit") return false
+        return blockCanCompleteNormally(ctx.block())
+    }
+
+    private fun blockCanCompleteNormally(ctx: MiniKotlinParser.BlockContext): Boolean {
+        val statements = ctx.statement()
+        if (statements.isEmpty()) return true
+
+        for (statement in statements) {
+            if (!statementCanCompleteNormally(statement)) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun statementCanCompleteNormally(ctx: MiniKotlinParser.StatementContext): Boolean {
+        if (ctx.returnStatement() != null) return false
+
+        val ifStatement = ctx.ifStatement()
+        if (ifStatement != null) {
+            if (ifStatement.block().size < 2) return true
+
+            val thenCanComplete = blockCanCompleteNormally(ifStatement.block(0))
+            val elseCanComplete = blockCanCompleteNormally(ifStatement.block(1))
+            return thenCanComplete || elseCanComplete
+        }
+
+        return true
+    }
+
+
+    private fun indent(code: String): String {
+        val padding = "    ".repeat(1)
+        return code.lines().joinToString("\n") { line ->
+            if (line.isBlank()) line else padding + line
+        }
+    }
+
     private fun renderBinary(
         left: MiniKotlinParser.ExpressionContext,
         operator: String,
         right: MiniKotlinParser.ExpressionContext
     ): String = "(${visit(left)} $operator ${visit(right)})"
 
+    private fun renderEquality(left: String, right: String, isEqual: Boolean): String {
+        val equalsCall = "java.util.Objects.equals($left, $right)"
+        return if (isEqual) equalsCall else "(!$equalsCall)"
+    }
+
+    //=======================TRIVIAL EXPRESSIONS============================
     override fun visitFunctionCallExpr(ctx: MiniKotlinParser.FunctionCallExprContext): String {
         val functionName = ctx.IDENTIFIER().text
         val arguments = ctx.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
@@ -569,8 +631,10 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         "(!(${visit(ctx.expression())}))"
 
     override fun visitEqualityExpr(ctx: MiniKotlinParser.EqualityExprContext): String {
-        val operator = if (ctx.EQ() != null) "==" else "!="
-        return renderBinary(ctx.expression(0), operator, ctx.expression(1))
+        val left = visit(ctx.expression(0))
+        val right = visit(ctx.expression(1))
+        val isEqual = ctx.EQ() != null
+        return renderEquality(left, right, isEqual)
     }
 
     override fun visitMulDivExpr(ctx: MiniKotlinParser.MulDivExprContext): String {
@@ -599,11 +663,4 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
 
     override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext): String =
         resolveReference(ctx.IDENTIFIER().text)
-
-    private fun indent(code: String): String {
-        val padding = "    ".repeat(1)
-        return code.lines().joinToString("\n") { line ->
-            if (line.isBlank()) line else padding + line
-        }
-    }
 }

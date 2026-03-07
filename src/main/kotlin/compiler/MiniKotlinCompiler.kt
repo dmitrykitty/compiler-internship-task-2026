@@ -76,17 +76,19 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         statements: List<MiniKotlinParser.StatementContext>,
         index: Int,
         isMain: Boolean,
-        kotlinReturnType: String
+        kotlinReturnType: String,
+        fallthroughCode: String = ""
     ): String {
-        if (index >= statements.size) return ""
+        if (index >= statements.size) return fallthroughCode
 
         val current = statements[index]
         fun rest(): String =
-            compileStatementsSequentially(statements, index + 1, isMain, kotlinReturnType)
+            compileStatementsSequentially(statements, index + 1, isMain, kotlinReturnType, fallthroughCode)
 
         compileCpsVariableDeclaration(current, ::rest)?.let { return it }
         compileCpsVariableAssignment(current, ::rest)?.let { return it }
         compileCpsCallStatement(current, ::rest)?.let { return it }
+        compileCpsWhileStatement(current, ::rest, isMain, kotlinReturnType)?.let { return it }
 
         val currentCode = compileStatement(current, isMain, kotlinReturnType).trimEnd()
         if (currentCode.isBlank()) return rest()
@@ -135,6 +137,38 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    private fun compileCpsWhileStatement(
+        statement: MiniKotlinParser.StatementContext,
+        rest: () -> String,
+        isMain: Boolean,
+        kotlinReturnType: String
+    ): String? {
+        val whileStatement = statement.whileStatement() ?: return null
+        val condition = whileStatement.expression()
+
+        if (!hasFunctionCall(condition)) return null
+
+        val loopName = nextLoopName()
+        val loopBackCode = "$loopName[0].run();"
+
+        val bodyCode = compileBlock(
+            whileStatement.block(),
+            isMain,
+            kotlinReturnType,
+            loopBackCode
+        )
+
+        val conditionCode = compileExpressionCps(condition) { conditionValue ->
+            buildIf(
+                condition = conditionValue,
+                thenBody = bodyCode,
+                elseBody = rest()
+            )
+        }
+
+        return buildRecursiveLoop(loopName, conditionCode)
+    }
+
     private fun compileCpsCallStatement(
         statement: MiniKotlinParser.StatementContext,
         rest: () -> String
@@ -161,9 +195,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private fun compileBlock(
         ctx: MiniKotlinParser.BlockContext,
         isMain: Boolean,
-        kotlinReturnType: String
+        kotlinReturnType: String,
+        fallthroughCode: String = ""
     ): String = withScope {
-        compileStatementsSequentially(ctx.statement(), 0, isMain, kotlinReturnType).trimEnd()
+        compileStatementsSequentially(ctx.statement(), 0, isMain, kotlinReturnType, fallthroughCode)
+            .trimEnd()
     }
 
     private fun compileStatement(
@@ -222,12 +258,8 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         kotlinReturnType: String
     ): String {
         val condition = ctx.expression()
-
-        if (hasFunctionCall(condition)) {
-            error("Function calls inside while conditions are not supported yet.")
-        }
-
         val body = compileBlock(ctx.block(), isMain, kotlinReturnType)
+
         return wrapInBraces("while (${visit(condition)})", body)
     }
 
@@ -428,6 +460,18 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             appendLine("$functionName(${arguments.joinToString(", ")}, ($continuationArg) -> {")
             if (body.isNotBlank()) appendLine(indent(body))
             appendLine("});")
+        }.trimEnd()
+    }
+
+    private fun nextLoopName(): String = "loop${tempCounter++}"
+
+    private fun buildRecursiveLoop(loopName: String, body: String): String {
+        return buildString {
+            appendLine("final Runnable[] $loopName = new Runnable[1];")
+            appendLine("$loopName[0] = () -> {")
+            if (body.isNotBlank()) appendLine(indent(body))
+            appendLine("};")
+            appendLine("$loopName[0].run();")
         }.trimEnd()
     }
 

@@ -11,11 +11,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         program: MiniKotlinParser.ProgramContext,
         className: String = "MiniProgram"
     ): String {
+        val safeClassName = sanitizeJavaIdentifier(className)
+
         val functions = program.functionDeclaration()
             .joinToString("\n\n") { indent(compileFunction(it).trimEnd()) }
 
         return buildString {
-            appendLine("public class $className {")
+            appendLine("public class $safeClassName {")
             if (functions.isNotBlank()) {
                 appendLine()
                 appendLine(functions)
@@ -28,11 +30,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private fun compileFunction(ctx: MiniKotlinParser.FunctionDeclarationContext): String {
         resetFunctionState()
 
-        val functionName = ctx.IDENTIFIER().text
+        val originalFunctionName = ctx.IDENTIFIER().text
         val kotlinReturnType = ctx.type().text
-        val isMain = functionName == "main"
+        val isMain = originalFunctionName == "main"
 
-        val header = buildFunctionHeader(ctx, functionName, kotlinReturnType)
+        val header = buildFunctionHeader(ctx, originalFunctionName, kotlinReturnType)
         val body = compileBlock(ctx.block(), isMain, kotlinReturnType)
 
         val finalBody = if (shouldEmitImplicitUnitReturn(ctx, isMain, kotlinReturnType)) {
@@ -58,17 +60,19 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             return "public static void main(String[] args)"
         }
 
+        val safeFunctionName = sanitizeJavaIdentifier(functionName)
+
         val params = ctx.parameterList()
             ?.parameter()
             ?.map { param ->
-                val name = param.IDENTIFIER().text
+                val name = sanitizeJavaIdentifier(param.IDENTIFIER().text)
                 val type = toJavaType(param.type().text)
                 "$type $name"
             }
             ?: emptyList()
 
         val allParams = params + continuationParameter(kotlinReturnType)
-        return "public static void $functionName(${allParams.joinToString(", ")})"
+        return "public static void $safeFunctionName(${allParams.joinToString(", ")})"
     }
 
 
@@ -106,13 +110,14 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
 
         if (!hasFunctionCall(expr)) return null
 
-        val name = declaration.IDENTIFIER().text
+        val originalName = declaration.IDENTIFIER().text
+        val safeName = sanitizeJavaIdentifier(originalName)
         val type = toJavaType(declaration.type().text)
 
         return compileExpressionCps(expr) { value ->
-            declareLocal(name)
+            declareLocal(originalName)
             joinCode(
-                "final $type[] $name = new $type[]{$value};",
+                "final $type[] $safeName = new $type[]{$value};",
                 rest()
             )
         }
@@ -175,19 +180,20 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     ): String? {
         val expr = statement.expression() as? MiniKotlinParser.FunctionCallExprContext ?: return null
 
-        val functionName = expr.IDENTIFIER().text
+        val originalFunctionName = expr.IDENTIFIER().text
+        val safeFunctionName = sanitizeJavaIdentifier(originalFunctionName)
         val arguments = expr.argumentList()?.expression() ?: emptyList()
 
         return compileArgumentsCps(arguments) { compiledArgs ->
             val tempName = nextTempName()
 
-            if (functionName == "println") {
+            if (originalFunctionName == "println") {
                 val value = compiledArgs.singleOrNull()
                     ?: error("println expects exactly one argument")
 
                 buildContinuationCall("Prelude.println", listOf(value), tempName, rest())
             } else {
-                buildContinuationCall(functionName, compiledArgs, tempName, rest())
+                buildContinuationCall(safeFunctionName, compiledArgs, tempName, rest())
             }
         }
     }
@@ -303,12 +309,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private fun compileVariableDeclaration(
         ctx: MiniKotlinParser.VariableDeclarationContext
     ): String {
-        val name = ctx.IDENTIFIER().text
+        val originalName = ctx.IDENTIFIER().text
+        val safeName = sanitizeJavaIdentifier(originalName)
         val type = toJavaType(ctx.type().text)
         val value = visit(ctx.expression())
 
-        declareLocal(name)
-        return "final $type[] $name = new $type[]{$value};"
+        declareLocal(originalName)
+        return "final $type[] $safeName = new $type[]{$value};"
     }
 
 
@@ -365,13 +372,14 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         expr: MiniKotlinParser.FunctionCallExprContext,
         onComplete: (String) -> String
     ): String {
-        val functionName = expr.IDENTIFIER().text
+        val originalFunctionName = expr.IDENTIFIER().text
+        val safeFunctionName = sanitizeJavaIdentifier(originalFunctionName)
         val arguments = expr.argumentList()?.expression() ?: emptyList()
 
         return compileArgumentsCps(arguments) { compiledArgs ->
             val tempName = nextTempName()
             buildContinuationCall(
-                functionName,
+                safeFunctionName,
                 compiledArgs,
                 tempName,
                 onComplete(tempName)
@@ -507,14 +515,16 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private fun isLocal(name: String): Boolean =
         localScopes.asReversed().any { name in it }
 
-    private fun resolveReference(name: String): String =
-        if (isLocal(name)) "$name[0]" else name
+    private fun resolveReference(name: String): String {
+        val safeName = sanitizeJavaIdentifier(name)
+        return if (isLocal(name)) "$safeName[0]" else safeName
+    }
 
     private fun continuationParameter(kotlinType: String): String =
         "Continuation<${toJavaType(kotlinType)}> __continuation"
 
     private fun isTerminal(ctx: MiniKotlinParser.StatementContext): Boolean =
-        ctx.returnStatement() != null
+        !statementCanCompleteNormally(ctx)
 
     private fun toJavaType(type: String): String {
         return when (type) {
@@ -644,11 +654,25 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return if (isEqual) equalsCall else "(!$equalsCall)"
     }
 
+    private val javaKeywords = setOf(
+        "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char",
+        "class", "const", "continue", "default", "do", "double", "else", "enum",
+        "extends", "final", "finally", "float", "for", "goto", "if", "implements",
+        "import", "instanceof", "int", "interface", "long", "native", "new", "package",
+        "private", "protected", "public", "return", "short", "static", "strictfp",
+        "super", "switch", "synchronized", "this", "throw", "throws", "transient",
+        "try", "void", "volatile", "while"
+    )
+
+    private fun sanitizeJavaIdentifier(name: String): String =
+        if (name in javaKeywords) "${name}_" else name
+
     //=======================TRIVIAL EXPRESSIONS============================
     override fun visitFunctionCallExpr(ctx: MiniKotlinParser.FunctionCallExprContext): String {
-        val functionName = ctx.IDENTIFIER().text
+        val originalFunctionName = ctx.IDENTIFIER().text
+        val safeFunctionName = sanitizeJavaIdentifier(originalFunctionName)
         val arguments = ctx.argumentList()?.expression()?.map { visit(it) } ?: emptyList()
-        return "$functionName(${arguments.joinToString(", ")})"
+        return "$safeFunctionName(${arguments.joinToString(", ")})"
     }
 
     override fun visitParenExpr(ctx: MiniKotlinParser.ParenExprContext): String =

@@ -1,0 +1,9 @@
+fun inc(x: Int): Int {
+    return x + 1
+}
+
+fun main(): Unit {
+    var x: Int = 1
+    x = inc(x)
+    println(x)
+}

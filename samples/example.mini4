@@ -1,0 +1,13 @@
+//Fibonacci
+
+fun fib(n: Int): Int {
+    if (n <= 1) {
+        return n
+    } else {
+        return fib(n - 1) + fib(n - 2)
+    }
+}
+
+fun main(): Unit {
+    println(fib(6))
+}

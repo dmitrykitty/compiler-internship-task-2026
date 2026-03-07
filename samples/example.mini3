@@ -1,0 +1,11 @@
+//lazy && ||
+
+fun boom(x: Int): Boolean {
+    println(x)
+    return x > 100
+}
+
+fun main(): Unit {
+    println(false && boom(101))
+    println(true || boom(101))
+}

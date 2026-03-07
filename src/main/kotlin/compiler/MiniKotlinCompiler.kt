@@ -7,6 +7,28 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private var counter = 0
     private fun nextArg() = "arg${counter++}"
 
+    private val scopeStack = mutableListOf<MutableSet<String>>()
+
+    private fun withScope(block: () -> String): String {
+        scopeStack.add(mutableSetOf())
+        return try {
+            block()
+        } finally {
+            scopeStack.removeAt(scopeStack.lastIndex)
+        }
+    }
+
+    private fun declareLocal(name: String) {
+        if (scopeStack.isEmpty()) scopeStack.add(mutableSetOf())
+        scopeStack.last().add(name)
+    }
+
+    private fun isLocal(name: String): Boolean =
+        scopeStack.asReversed().any { name in it }
+
+    private fun ref(name: String): String =
+        if (isLocal(name)) "$name[0]" else name
+
     fun compile(program: MiniKotlinParser.ProgramContext, className: String = "MiniProgram"): String {
         val functions = program.functionDeclaration()
             .joinToString("\n\n") { indent(genFunction(it).trimEnd(), 1) }
@@ -23,9 +45,10 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
     private fun genFunction(ctx: MiniKotlinParser.FunctionDeclarationContext): String {
+        scopeStack.clear()
+
         val name = ctx.IDENTIFIER().text
         val kotlinReturnType = ctx.type().text
-        //val javaReturnType = mapType(kotlinReturnType)
 
         val params = ctx.parameterList()?.parameter()?.map { p ->
             val id = p.IDENTIFIER().text
@@ -39,6 +62,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             val allParams = params + continuationParam(kotlinReturnType)
             "public static void $name(${allParams.joinToString(", ")})"
         }
+
         val isMain = (name == "main")
         val body = genBlock(ctx.block(), isMain, kotlinReturnType)
 
@@ -68,10 +92,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             val expr = vd.expression()
 
             if (containsFunctionCall(expr)) {
-                val restCode = rest()
                 return emitExprCps(expr) { value ->
+                    declareLocal(name)
+                    val restCode = rest()
                     buildString {
-                        appendLine("$type $name = $value;")
+                        appendLine("final $type[] $name = new $type[]{$value};")
                         if (restCode.isNotBlank()) append(restCode)
                     }.trimEnd()
                 }
@@ -87,7 +112,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
                 val restCode = rest()
                 return emitExprCps(expr) { value ->
                     buildString {
-                        appendLine("$name = $value;")
+                        appendLine("${ref(name)} = $value;")
                         if (restCode.isNotBlank()) append(restCode)
                     }.trimEnd()
                 }
@@ -123,13 +148,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
 
         // 4) Normalny statement
         val cur = genStatement(curSt, isMain, kotlinReturnType).trimEnd()
-        val restCode = rest()
+        if (cur.isBlank()) return rest()
 
-        return when {
-            cur.isBlank() -> restCode
-            restCode.isBlank() -> cur
-            else -> cur + "\n" + restCode
-        }
+        if (isTerminalStatement(curSt)) return cur
+
+        val restCode = rest()
+        return if (restCode.isBlank()) cur else cur + "\n" + restCode
     }
 
     private fun emitArgsCps(
@@ -143,7 +167,6 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
                 loop(index + 1, acc + value)
             }
         }
-
         return loop(0, emptyList())
     }
 
@@ -227,9 +250,9 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         ctx: MiniKotlinParser.BlockContext,
         isMain: Boolean,
         kotlinReturnType: String
-    ): String {
+    ): String = withScope {
         val st = ctx.statement()
-        return genStatements(st, 0, isMain, kotlinReturnType).trimEnd()
+        genStatements(st, 0, isMain, kotlinReturnType).trimEnd()
     }
 
     private fun genStatement(
@@ -284,9 +307,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
 
         return if (containsFunctionCall(condExpr)) {
-            emitExprCps(condExpr) { condValue ->
-                buildIf(condValue)
-            }
+            emitExprCps(condExpr) { condValue -> buildIf(condValue) }
         } else {
             buildIf(visit(condExpr))
         }
@@ -336,20 +357,24 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     private fun genVariableAssignment(ctx: MiniKotlinParser.VariableAssignmentContext): String {
         val name = ctx.IDENTIFIER().text
         val expr = visit(ctx.expression())
-        return "$name = $expr;"
+        return "${ref(name)} = $expr;"
     }
 
     private fun genExpressionStatement(expr: MiniKotlinParser.ExpressionContext): String {
-        return "${visit(expr)};"
+        return if (expr is MiniKotlinParser.FunctionCallExprContext) {
+            "${visit(expr)};"
+        } else {
+            "// ignored pure expression statement"
+        }
     }
 
     private fun genVariableDeclaration(ctx: MiniKotlinParser.VariableDeclarationContext): String {
-
         val name = ctx.IDENTIFIER().text
         val type = mapType(ctx.type().text)
         val expr = visit(ctx.expression())
 
-        return "$type $name = $expr;"
+        declareLocal(name)
+        return "final $type[] $name = new $type[]{$expr};"
     }
 
     override fun visitFunctionCallExpr(ctx: MiniKotlinParser.FunctionCallExprContext): String {
@@ -379,8 +404,6 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
 
         return "($left $operator $right)"
     }
-
-    //TODO: LAZY OR AND AND operators after if statement and function call
 
     override fun visitAndExpr(ctx: MiniKotlinParser.AndExprContext): String {
         val left = visit(ctx.expression(0))
@@ -444,7 +467,7 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
     override fun visitIdentifierExpr(ctx: MiniKotlinParser.IdentifierExprContext): String {
-        return ctx.IDENTIFIER().text
+        return ref(ctx.IDENTIFIER().text)
     }
 
     private fun containsFunctionCall(expr: MiniKotlinParser.ExpressionContext): Boolean = when (expr) {
@@ -483,8 +506,9 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return "Continuation<${mapType(kotlinType)}> __continuation"
     }
 
-    private fun binaryParts(expr: MiniKotlinParser.ExpressionContext)
-            : Triple<MiniKotlinParser.ExpressionContext, String, MiniKotlinParser.ExpressionContext>? {
+    private fun binaryParts(
+        expr: MiniKotlinParser.ExpressionContext
+    ): Triple<MiniKotlinParser.ExpressionContext, String, MiniKotlinParser.ExpressionContext>? {
         return when (expr) {
             is MiniKotlinParser.AddSubExprContext ->
                 Triple(expr.expression(0), expr.getChild(1).text, expr.expression(1))
@@ -502,6 +526,9 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    private fun isTerminalStatement(ctx: MiniKotlinParser.StatementContext): Boolean {
+        return ctx.returnStatement() != null
+    }
 
     private fun mapType(type: String): String {
         return when (type) {

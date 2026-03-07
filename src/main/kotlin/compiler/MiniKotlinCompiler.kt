@@ -3,10 +3,42 @@ package org.example.compiler
 import MiniKotlinBaseVisitor
 
 
+/**
+ * Compiler from a MiniKotlin subset to Java in continuation-passing style (CPS).
+ *
+ * Main compilation rules:
+ * - every non-main function is translated to a Java method with an extra
+ *   `Continuation<T>` parameter,
+ * - function calls inside expressions are lowered into nested continuations,
+ * - mutable local variables are represented as single-element arrays so they can
+ *   be safely captured and updated inside Java lambdas,
+ * - `&&` and `||` preserve Kotlin short-circuit semantics,
+ * - `==` and `!=` are compiled using `java.util.Objects.equals(...)` to better
+ *   match Kotlin equality semantics,
+ * - function calls inside `while` conditions are supported by lowering the loop
+ *   to a recursive `Runnable`.
+ */
 class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
+    /**
+     * Shared counter used to generate unique temporary names for CPS arguments
+     * (`arg0`, `arg1`, ...) and synthetic loop variables (`loop0`, `loop1`, ...).
+     */
     private var tempCounter = 0
+
+    /**
+     * Stack of local scopes.
+     *
+     * Each scope stores source-level variable names declared in the corresponding
+     * block. A variable declared in a local scope is compiled as a boxed mutable
+     * cell (`Type[]`) and must later be referenced through `[0]`.
+     */
     private val localScopes = mutableListOf<MutableSet<String>>()
 
+    /**
+     * Compiles the whole MiniKotlin program into a single Java class.
+     *
+     * The class name is sanitized so it does not collide with Java keywords.
+     */
     fun compile(
         program: MiniKotlinParser.ProgramContext,
         className: String = "MiniProgram"
@@ -27,6 +59,14 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Compiles a single function declaration.
+     *
+     * - `main` is emitted as a standard Java entry point,
+     * - every other function gets an extra continuation parameter,
+     * - `Unit` functions that may naturally fall through get an implicit
+     *   `__continuation.accept(null); return;` appended at the end.
+     */
     private fun compileFunction(ctx: MiniKotlinParser.FunctionDeclarationContext): String {
         resetFunctionState()
 
@@ -46,36 +86,15 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return wrapInBraces(header, finalBody)
     }
 
-    private fun resetFunctionState() {
-        tempCounter = 0
-        localScopes.clear()
-    }
-
-    private fun buildFunctionHeader(
-        ctx: MiniKotlinParser.FunctionDeclarationContext,
-        functionName: String,
-        kotlinReturnType: String
-    ): String {
-        if (functionName == "main") {
-            return "public static void main(String[] args)"
-        }
-
-        val safeFunctionName = sanitizeJavaIdentifier(functionName)
-
-        val params = ctx.parameterList()
-            ?.parameter()
-            ?.map { param ->
-                val name = sanitizeJavaIdentifier(param.IDENTIFIER().text)
-                val type = toJavaType(param.type().text)
-                "$type $name"
-            }
-            ?: emptyList()
-
-        val allParams = params + continuationParameter(kotlinReturnType)
-        return "public static void $safeFunctionName(${allParams.joinToString(", ")})"
-    }
-
-
+    /**
+     * Compiles statements in order while threading through the code that should
+     * run afterwards (`fallthroughCode`).
+     *
+     * This method is the core of statement sequencing in CPS form:
+     * - it detects special cases that need CPS lowering,
+     * - it appends the "rest of the computation" after the current statement,
+     * - it stops when it reaches a terminal statement.
+     */
     private fun compileStatementsSequentially(
         statements: List<MiniKotlinParser.StatementContext>,
         index: Int,
@@ -101,6 +120,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return joinCode(currentCode, rest())
     }
 
+    /**
+     * Handles a variable declaration whose initializer contains a function call.
+     *
+     * Such a declaration cannot be emitted directly, because the initializer value
+     * becomes available only through a continuation. The declaration is therefore
+     * delayed until the expression has been CPS-lowered.
+     */
     private fun compileCpsVariableDeclaration(
         statement: MiniKotlinParser.StatementContext,
         rest: () -> String
@@ -123,6 +149,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Handles an assignment whose right-hand side contains a function call.
+     *
+     * The assignment itself is postponed until the CPS-transformed expression
+     * produces its value.
+     */
     private fun compileCpsVariableAssignment(
         statement: MiniKotlinParser.StatementContext,
         rest: () -> String
@@ -142,6 +174,16 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Handles `while` loops whose condition contains a function call.
+     *
+     * A normal Java `while (...)` cannot directly express a CPS condition, so the
+     * loop is lowered into a recursive `Runnable`. Each iteration:
+     * - evaluates the CPS condition,
+     * - executes the body when true,
+     * - jumps back to the synthetic loop runner,
+     * - or continues with the code after the loop when false.
+     */
     private fun compileCpsWhileStatement(
         statement: MiniKotlinParser.StatementContext,
         rest: () -> String,
@@ -174,6 +216,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return buildRecursiveLoop(loopName, conditionCode)
     }
 
+    /**
+     * Handles expression statements that are plain function calls.
+     *
+     * Example:
+     * `foo(x)` becomes `foo(x, (arg0) -> { ...rest... });`
+     */
     private fun compileCpsCallStatement(
         statement: MiniKotlinParser.StatementContext,
         rest: () -> String
@@ -198,6 +246,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Compiles a block in its own nested scope.
+     *
+     * `fallthroughCode` represents code that should run when the block finishes
+     * normally, for example the continuation of a CPS loop body.
+     */
     private fun compileBlock(
         ctx: MiniKotlinParser.BlockContext,
         isMain: Boolean,
@@ -208,6 +262,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
             .trimEnd()
     }
 
+    /**
+     * Compiles a single statement in the direct, non-sequential sense.
+     *
+     * Sequencing and CPS-aware control flow are handled by
+     * [compileStatementsSequentially].
+     */
     private fun compileStatement(
         ctx: MiniKotlinParser.StatementContext,
         isMain: Boolean,
@@ -236,6 +296,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Compiles an `if` statement.
+     *
+     * When the condition contains a function call, the condition is first lowered
+     * through CPS; otherwise it is emitted as a normal Java conditional.
+     */
     private fun compileIfStatement(
         ctx: MiniKotlinParser.IfStatementContext,
         isMain: Boolean,
@@ -258,6 +324,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Compiles a `while` loop whose condition has no function calls.
+     *
+     * The CPS-aware `while` case is handled separately by [compileCpsWhileStatement].
+     */
     private fun compileWhileStatement(
         ctx: MiniKotlinParser.WhileStatementContext,
         isMain: Boolean,
@@ -269,6 +340,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return wrapInBraces("while (${visit(condition)})", body)
     }
 
+    /**
+     * Compiles a return statement.
+     *
+     * For non-main functions, returning means invoking the continuation and then
+     * immediately exiting the Java method.
+     */
     private fun compileReturnStatement(
         ctx: MiniKotlinParser.ReturnStatementContext,
         isMain: Boolean
@@ -288,6 +365,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Compiles a variable assignment in the non-CPS case.
+     *
+     * The right-hand side is emitted directly because it contains no function calls.
+     * The left-hand side is resolved through [resolveReference], so local mutable
+     * variables become `name[0]` while parameters remain plain identifiers.
+     */
     private fun compileVariableAssignment(
         ctx: MiniKotlinParser.VariableAssignmentContext
     ): String {
@@ -296,16 +380,29 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return "${resolveReference(name)} = $value;"
     }
 
+    /**
+     * Compiles an expression used as a standalone statement.
+     *
+     * Only function-call expressions produce meaningful Java statements here.
+     * Pure expressions such as `1 + 2` are ignored because evaluating them has no
+     * effect in the generated program.
+     */
     private fun compileExpressionStatement(
         expr: MiniKotlinParser.ExpressionContext
     ): String {
         return if (expr is MiniKotlinParser.FunctionCallExprContext) {
             "${visit(expr)};"
         } else {
-            "// ignored pure expression statement"
+            ""
         }
     }
 
+    /**
+     * Compiles a variable declaration in the non-CPS case.
+     *
+     * Local variables are boxed into single-element arrays so they can later be
+     * mutated from inside Java lambdas.
+     */
     private fun compileVariableDeclaration(
         ctx: MiniKotlinParser.VariableDeclarationContext
     ): String {
@@ -319,6 +416,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
 
+    /**
+     * Sequentially CPS-compiles call arguments from left to right.
+     *
+     * This preserves evaluation order before the enclosing function call is emitted.
+     */
     private fun compileArgumentsCps(
         arguments: List<MiniKotlinParser.ExpressionContext>,
         onComplete: (List<String>) -> String
@@ -334,6 +436,13 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         return loop(0, emptyList())
     }
 
+    /**
+     * Lowers an expression into CPS only when needed.
+     *
+     * Expressions without function calls are emitted directly.
+     * Expressions containing calls are recursively transformed so that all needed
+     * intermediate values become available through continuations.
+     */
     private fun compileExpressionCps(
         expr: MiniKotlinParser.ExpressionContext,
         onComplete: (String) -> String
@@ -368,6 +477,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * CPS-compiles a direct function call expression.
+     *
+     * The produced temporary continuation argument name is then passed to
+     * [onComplete] as the value of the whole expression.
+     */
     private fun compileFunctionCallExpressionCps(
         expr: MiniKotlinParser.FunctionCallExprContext,
         onComplete: (String) -> String
@@ -387,7 +502,12 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
-
+    /**
+     * CPS-compiles a binary expression.
+     *
+     * Equality operators are emitted specially to preserve Kotlin-like equality
+     * semantics through `Objects.equals(...)`.
+     */
     private fun compileBinaryExpressionCps(
         operation: BinaryOperation,
         onComplete: (String) -> String
@@ -404,6 +524,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Preserves Kotlin short-circuit semantics for `&&`.
+     *
+     * The right-hand side is compiled only when the left-hand side evaluates to true.
+     */
     private fun compileLazyAnd(
         expr: MiniKotlinParser.AndExprContext,
         onComplete: (String) -> String
@@ -422,6 +547,11 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
         }
     }
 
+    /**
+     * Preserves Kotlin short-circuit semantics for `||`.
+     *
+     * The right-hand side is compiled only when the left-hand side evaluates to false.
+     */
     private fun compileLazyOr(
         expr: MiniKotlinParser.OrExprContext,
         onComplete: (String) -> String
@@ -441,6 +571,36 @@ class MiniKotlinCompiler : MiniKotlinBaseVisitor<String>() {
     }
 
     //=======================HELPERS============================
+
+    private fun resetFunctionState() {
+        tempCounter = 0
+        localScopes.clear()
+    }
+
+    private fun buildFunctionHeader(
+        ctx: MiniKotlinParser.FunctionDeclarationContext,
+        functionName: String,
+        kotlinReturnType: String
+    ): String {
+        if (functionName == "main") {
+            return "public static void main(String[] args)"
+        }
+
+        val safeFunctionName = sanitizeJavaIdentifier(functionName)
+
+        val params = ctx.parameterList()
+            ?.parameter()
+            ?.map { param ->
+                val name = sanitizeJavaIdentifier(param.IDENTIFIER().text)
+                val type = toJavaType(param.type().text)
+                "$type $name"
+            }
+            ?: emptyList()
+
+        val allParams = params + continuationParameter(kotlinReturnType)
+        return "public static void $safeFunctionName(${allParams.joinToString(", ")})"
+    }
+
     private fun buildIf(
         condition: String,
         thenBody: String,

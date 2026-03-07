@@ -390,4 +390,80 @@ class MiniKotlinCompilerTest {
 
         assertProgramOutput(source, "7")
     }
+
+    @Test
+    fun `if with returns in both branches is terminal`() {
+        val source = """
+        fun test(x: Int): Int {
+            if (x > 0) {
+                return 1
+            } else {
+                return 2
+            }
+        }
+
+        fun main(): Unit {
+            println(test(5))
+        }
+    """.trimIndent()
+
+        assertProgramOutput(source, "1")
+    }
+
+    @Test
+    fun `code after fully terminal if is not generated into flow`() {
+        val source = """
+        fun test(x: Int): Int {
+            if (x > 0) {
+                return 1
+            } else {
+                return 2
+            }
+            return 3
+        }
+
+        fun main(): Unit {
+            println(test(5))
+            println(test(0))
+        }
+    """.trimIndent()
+
+        assertProgramOutput(source, "1", "2")
+    }
+
+    @Test
+    fun `nested while with function call conditions works`() {
+        val source = """
+        fun lessThanTwo(x: Int): Boolean {
+            return x < 2
+        }
+
+        fun lessThanThree(x: Int): Boolean {
+            return x < 3
+        }
+
+        fun main(): Unit {
+            var i: Int = 0
+            while (lessThanTwo(i)) {
+                var j: Int = 0
+                while (lessThanThree(j)) {
+                    println(i)
+                    println(j)
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+    """.trimIndent()
+
+        assertProgramOutput(
+            source,
+            "0", "0",
+            "0", "1",
+            "0", "2",
+            "1", "0",
+            "1", "1",
+            "1", "2"
+        )
+    }
 }
